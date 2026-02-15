@@ -11,18 +11,19 @@ st.title("🎯 Strike‑wise Intraday Option Analysis")
 def load_files(files):
     dfs=[]
     for f in files:
-        # Extract timestamp from pattern *_ddmmyyyy_hhmmss.csv
-        match=re.search(r"(\d{2})(\d{2})(\d{4})_(\d{2})(\d{2})(\d{2})", f.name)
+        # extract only time part (hhmmss) from filename pattern *_ddmmyyyy_hhmmss.csv
+        match=re.search(r"_(\d{2})(\d{2})(\d{4})_(\d{2})(\d{2})(\d{2})\.csv$", f.name)
         if match:
-            dd,mm,yyyy,hh,mi,ss=match.groups()
-            ts=datetime.strptime(f"{dd}{mm}{yyyy}{hh}{mi}{ss}","%d%m%Y%H%M%S")
+            hh,mi,ss=match.group(4),match.group(5),match.group(6)
+            file_time=f"{hh}:{mi}:{ss}"
         else:
-            ts=pd.Timestamp.utcnow()
+            file_time="00:00:00"
 
         df=pd.read_csv(f)
-        df["timestamp"]=ts
+        df["file_time"]=file_time
         dfs.append(df)
-    data=pd.concat(dfs).sort_values("timestamp").reset_index(drop=True)
+
+    data=pd.concat(dfs).reset_index(drop=True)
     return data
 
 files=st.file_uploader("Upload multiple 5‑min CSVs (format *_ddmmyyyy_hhmmss.csv)",type="csv",accept_multiple_files=True)
@@ -49,6 +50,9 @@ if files:
         df=data[data["CE_strikePrice"]==sel_strike].reset_index(drop=True)
         st.info(f"Analyzing strike {sel_strike}")
 
+        # create timestamp from file_time for proper order
+        df["timestamp"]=pd.to_datetime(df["file_time"],format="%H:%M:%S",errors="coerce")
+
         for s in ["CE","PE"]:
             if f"{s}_lastPrice" not in df.columns: continue
             df[f"{s}_price_change"]=df[f"{s}_lastPrice"].diff()
@@ -58,7 +62,7 @@ if files:
                 df[f"{s}_ma5"]=df[f"{s}_lastPrice"].rolling(5).mean()
                 df[f"{s}_ma10"]=df[f"{s}_lastPrice"].rolling(10).mean()
 
-        # choose side(s)
+        # choose sides
         plot_sides=[]
         if side_opt in ("CE","Both"): plot_sides.append("CE")
         if side_opt in ("PE","Both"): plot_sides.append("PE")
@@ -85,24 +89,27 @@ if files:
             for s in plot_sides:
                 data_series=df[f"{s}_{base}"]
                 if chart_type=="Line":
-                    ax.plot(df["timestamp"],data_series,color=colors[s],label=s)
+                    ax.plot(df["file_time"],data_series,color=colors[s],label=s)
                     if base=="lastPrice" and show_ma:
-                        ax.plot(df["timestamp"],df[f"{s}_ma5"],"--",color=colors[s],alpha=0.6,label=f"{s} MA5")
-                        ax.plot(df["timestamp"],df[f"{s}_ma10"],":",color=colors[s],alpha=0.4,label=f"{s} MA10")
+                        ax.plot(df["file_time"],df[f"{s}_ma5"],"--",color=colors[s],alpha=0.6,label=f"{s} MA5")
+                        ax.plot(df["file_time"],df[f"{s}_ma10"],":",color=colors[s],alpha=0.4,label=f"{s} MA10")
                 else:
-                    ax.bar(df["timestamp"],data_series,color=colors[s],label=s,alpha=0.6)
-            ax.legend(); ax.set_title(titles[i])
+                    ax.bar(df["file_time"],data_series,color=colors[s],label=s,alpha=0.6)
+            ax.legend()
+            ax.set_title(titles[i])
+            ax.set_xlabel("File Time (hh:mm:ss)")
+            plt.xticks(rotation=45)
             st.pyplot(fig)
 
         # ---------- Direction Summary ----------
         st.subheader("📈 Directional Summary")
         def direction_text(price_d, oi_d, side):
             if price_d>0 and oi_d>0:
-                return f"{side}: Price↑ & OI↑ → **Long / Bullish build-up**"
+                return f"{side}: Price↑ & OI↑ → **Long / Bullish build‑up**"
             elif price_d<0 and oi_d<0:
                 return f"{side}: Price↓ & OI↓ → **Unwinding**"
             elif price_d<0 and oi_d>0:
-                return f"{side}: Price↓ & OI↑ → **Short build-up**"
+                return f"{side}: Price↓ & OI↑ → **Short build‑up**"
             else:
                 return f"{side}: Mixed / No clear direction"
         for m in metrics:
@@ -111,6 +118,4 @@ if files:
 else:
     st.write("👆 Upload intraday 5‑min CSV files to start.")
 
-st.caption("Tips: moving averages smooth noisy ticks; use Both‑side view for CE/PE comparison.")
-
-
+st.caption("X‑axis shows file times extracted from filenames; add more files in sequence for longer intraday chains.")
