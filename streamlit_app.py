@@ -1,121 +1,135 @@
-import streamlit as st, pandas as pd, numpy as np, matplotlib.pyplot as plt
-from datetime import datetime
-import re
+# streamlit_app.py
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+import glob, os
 
-# ---------- Page Setup ----------
-st.set_page_config(page_title="Strike‑wise Intraday Analyzer", layout="wide")
-st.title("🎯 Strike‑wise Intraday Option Analysis")
+st.set_page_config(page_title="Strike‑Wise Intraday Analytics", layout="wide")
+st.title("🚀 Strike‑Wise Intraday Analytics Dashboard")
 
-# ---------- Upload & Load ----------
-@st.cache_data
-def load_files(files):
-    dfs=[]
-    for f in files:
-        # extract only time part (hhmmss) from filename pattern *_ddmmyyyy_hhmmss.csv
-        match=re.search(r"_(\d{2})(\d{2})(\d{4})_(\d{2})(\d{2})(\d{2})\.csv$", f.name)
-        if match:
-            hh,mi,ss=match.group(4),match.group(5),match.group(6)
-            file_time=f"{hh}:{mi}:{ss}"
-        else:
-            file_time="00:00:00"
+# ----------  LOAD & PREP  ----------
+files = sorted(glob.glob("*_[0-9]*.csv"))
+if not files:
+    st.warning("No CSVs found. Expected filenames like XYZ_05032024_093500.csv")
+    st.stop()
 
-        df=pd.read_csv(f)
-        df["file_time"]=file_time
-        dfs.append(df)
+multi_df = []
+for f in files:
+    ts = os.path.splitext(f)[0].split("_")[-1]
+    try:
+        dt = pd.to_datetime(ts, format="%d%m%Y_%H%M%S")
+    except:
+        dt = pd.to_datetime("now")
+    df = pd.read_csv(f)
+    df["timestamp"] = dt
+    multi_df.append(df)
 
-    data=pd.concat(dfs).reset_index(drop=True)
-    return data
+df = pd.concat(multi_df).sort_values("timestamp").reset_index(drop=True)
+df['CE_strikePrice'] = df['CE_strikePrice'].round()
+df['PE_strikePrice'] = df['PE_strikePrice'].round()
 
-files=st.file_uploader("Upload multiple 5‑min CSVs (format *_ddmmyyyy_hhmmss.csv)",type="csv",accept_multiple_files=True)
+# ----------  SIDEBAR SETTINGS  ----------
+st.sidebar.header("Filters")
+strike = st.sidebar.selectbox("Strike Price", sorted(df['CE_strikePrice'].unique()))
+view = st.sidebar.radio("View", ["CE", "PE", "Both"])
+ma_opt = st.sidebar.multiselect("Moving Avg", [5,10,20])
+agg_opt = st.sidebar.checkbox("Aggregate All Strikes", False)
 
-if files:
-    data=load_files(files)
-    st.success(f"✅ Merged {len(files)} files → {len(data)} rows")
+# ----------  BASIC SECTION ----------
+st.header("📊 Price & Volume Trends")
 
-    # ---------- Strike selector ----------
-    strikes=sorted(data["CE_strikePrice"].unique())
-    sel_strike=st.selectbox("Select Strike Price",strikes)
+def draw_price(df,v,label):
+    fig = px.line(df, x='timestamp', y=v, title=label)
+    for w in ma_opt:
+        df[f"MA_{w}"] = df[v].rolling(w).mean()
+        fig.add_scatter(x=df['timestamp'], y=df[f"MA_{w}"], mode='lines', name=f"MA{w}")
+    st.plotly_chart(fig,use_container_width=True)
 
-    # ---------- Side selector ----------
-    side_opt=st.radio("Choose side(s) to analyze",["CE","PE","Both"],horizontal=True)
+data = df if agg_opt else df[df['CE_strikePrice']==strike]
 
-    # ---------- Chart options ----------
-    chart_col1, chart_col2 = st.columns(2)
-    with chart_col1:
-        chart_type=st.radio("Chart Type",["Line","Bar"],horizontal=True)
-    with chart_col2:
-        show_ma=st.checkbox("Show Moving Averages (5 & 10)",value=True)
+if view in ["CE","Both"]:
+    draw_price(data,'CE_lastPrice', f"CE Price @ {strike}")
+if view in ["PE","Both"]:
+    draw_price(data,'PE_lastPrice', f"PE Price @ {strike}")
 
-    if st.button("Analyze Strike"):
-        df=data[data["CE_strikePrice"]==sel_strike].reset_index(drop=True)
-        st.info(f"Analyzing strike {sel_strike}")
+# ----------  PRICE CHANGE / MOMENTUM ----------
+st.subheader("📈 Price Change & Momentum")
+data['CE_delta'] = data['CE_lastPrice'].diff()
+data['CE_pct'] = data['CE_lastPrice'].pct_change()*100
+fig = go.Figure()
+fig.add_trace(go.Bar(x=data['timestamp'], y=data['CE_pct'],
+                     marker_color=np.where(data['CE_pct']>0,'green','red')))
+fig.update_layout(title="CE % Change", showlegend=False)
+st.plotly_chart(fig,use_container_width=True)
 
-        # create timestamp from file_time for proper order
-        df["timestamp"]=pd.to_datetime(df["file_time"],format="%H:%M:%S",errors="coerce")
+# ----------  CORRELATION & CONVICTION ----------
+st.header("💪 Correlation & Volume Conviction")
+data['vol_diff'] = data['CE_totalTradedVolume'].diff()
+data['r_price_vol'] = data['CE_delta'].rolling(20).corr(data['vol_diff'])
+st.line_chart(data[['r_price_vol']])
+r_last = data['r_price_vol'].iloc[-1]
+st.metric("r (Price, Volume)", round(r_last,3))
 
-        for s in ["CE","PE"]:
-            if f"{s}_lastPrice" not in df.columns: continue
-            df[f"{s}_price_change"]=df[f"{s}_lastPrice"].diff()
-            df[f"{s}_vol_change"]=df[f"{s}_totalTradedVolume"].diff()
-            df[f"{s}_oi_change"]=df[f"{s}_openInterest"].diff()
-            if show_ma:
-                df[f"{s}_ma5"]=df[f"{s}_lastPrice"].rolling(5).mean()
-                df[f"{s}_ma10"]=df[f"{s}_lastPrice"].rolling(10).mean()
+# ----------  SIDE DOMINANCE ----------
+st.header("⚖️ Call vs Put Sentiment")
+r_call = data['CE_lastPrice'].rolling(20).corr(data['CE_openInterest'])
+r_put = data['PE_lastPrice'].rolling(20).corr(data['PE_openInterest'])
+oi_imb = (data['CE_openInterest']-data['PE_openInterest'])/(data['CE_openInterest']+data['PE_openInterest'])
+pc_ratio = data['PE_totalTradedVolume']/data['CE_totalTradedVolume']
+bias = np.where(oi_imb>0,"🟩 Bullish","🟥 Bearish")
+st.metric("Current Bias", bias[-1])
+fig = px.line(x=data['timestamp'], y=oi_imb, title="OI Imbalance (+CE pressure)")
+st.plotly_chart(fig,use_container_width=True)
 
-        # choose sides
-        plot_sides=[]
-        if side_opt in ("CE","Both"): plot_sides.append("CE")
-        if side_opt in ("PE","Both"): plot_sides.append("PE")
+# ----------  STRENGTH SCORE ----------
+st.header("🧮 Overall Strength Score")
+r_price_OI = data['CE_lastPrice'].rolling(20).corr(data['CE_openInterest'])
+strength = 0.4*r_price_OI + 0.3*r_last + 0.3*r_call
+data['strength'] = strength
+st.line_chart(data[['strength']])
+st.metric("Trend Health", round(data['strength'].dropna().iloc[-1],3))
 
-        # ---------- Key metrics ----------
-        metrics=[]
-        for side in plot_sides:
-            metrics.append({
-                "Side": side,
-                "Price Δ": df[f"{side}_lastPrice"].iloc[-1]-df[f"{side}_lastPrice"].iloc[0],
-                "OI Δ": df[f"{side}_openInterest"].iloc[-1]-df[f"{side}_openInterest"].iloc[0],
-                "Vol Δ": df[f"{side}_totalTradedVolume"].iloc[-1]-df[f"{side}_totalTradedVolume"].iloc[0],
-            })
-        st.subheader("📊 Metrics Snapshot")
-        st.dataframe(pd.DataFrame(metrics).round(2))
+# ----------  LEAD‑LAG ANALYSIS ----------
+st.header("🧠 Lead–Lag Correlation (OI→Price)")
+lags = range(-3,4)
+results=[]
+for l in lags:
+    results.append(data['CE_lastPrice'].corr(data['CE_openInterest'].shift(l)))
+leadlag = pd.DataFrame({'lag':lags,'corr':results})
+fig = px.bar(leadlag,x='lag',y='corr',title="CE Price ↔ OI Lag Corr")
+st.plotly_chart(fig,use_container_width=True)
+bestlag = leadlag.iloc[leadlag['corr'].idxmax()]['lag']
+st.metric("Leading Lag", bestlag)
 
-        # ---------- Plot section ----------
-        plots=["lastPrice","vol_change","oi_change"]
-        titles=["Price Over Time","Volume Change","Open Interest Change"]
-        colors={"CE":"green","PE":"red"}
+# ----------  ROLLING REGIME / ANOMALY ----------
+st.header("🔮 Regime & Anomaly Detection")
+rollcorr = data['CE_lastPrice'].rolling(20).corr(data['CE_openInterest'])
+data['signflip'] = np.sign(rollcorr).diff()
+flips = data[data['signflip']!=0]
+regime = "Bullish" if rollcorr.iloc[-1]>0 else "Bearish"
+st.metric("Current Regime", regime)
+fig = px.line(data, x='timestamp', y=rollcorr, title="Rolling Price–OI Correlation")
+fig.add_scatter(x=flips['timestamp'], y=flips['signflip']*0, mode='markers', name='Sign flip', marker_color='orange')
+st.plotly_chart(fig,use_container_width=True)
 
-        for i,base in enumerate(plots):
-            fig,ax=plt.subplots(figsize=(10,3))
-            for s in plot_sides:
-                data_series=df[f"{s}_{base}"]
-                if chart_type=="Line":
-                    ax.plot(df["file_time"],data_series,color=colors[s],label=s)
-                    if base=="lastPrice" and show_ma:
-                        ax.plot(df["file_time"],df[f"{s}_ma5"],"--",color=colors[s],alpha=0.6,label=f"{s} MA5")
-                        ax.plot(df["file_time"],df[f"{s}_ma10"],":",color=colors[s],alpha=0.4,label=f"{s} MA10")
-                else:
-                    ax.bar(df["file_time"],data_series,color=colors[s],label=s,alpha=0.6)
-            ax.legend()
-            ax.set_title(titles[i])
-            ax.set_xlabel("File Time (hh:mm:ss)")
-            plt.xticks(rotation=45)
-            st.pyplot(fig)
+# ----------  VISUAL DASHBOARD ----------
+st.header("🧭 Visualization Dashboard")
+cols=['CE_lastPrice','CE_openInterest','CE_totalTradedVolume','PE_lastPrice','PE_openInterest']
+corr=df[cols].corr()
+fig = px.imshow(corr, text_auto=True, color_continuous_scale='RdBu_r', title="Correlation Heatmap")
+st.plotly_chart(fig,use_container_width=True)
+scatter = px.scatter(data, x=data['CE_changeinOpenInterest'], y=data['CE_delta'],
+                     color=np.where(data['CE_delta']>0,'green','red'),
+                     title="ΔPrice vs ΔOI Quadrant (Strength map)")
+st.plotly_chart(scatter,use_container_width=True)
 
-        # ---------- Direction Summary ----------
-        st.subheader("📈 Directional Summary")
-        def direction_text(price_d, oi_d, side):
-            if price_d>0 and oi_d>0:
-                return f"{side}: Price↑ & OI↑ → **Long / Bullish build‑up**"
-            elif price_d<0 and oi_d<0:
-                return f"{side}: Price↓ & OI↓ → **Unwinding**"
-            elif price_d<0 and oi_d>0:
-                return f"{side}: Price↓ & OI↑ → **Short build‑up**"
-            else:
-                return f"{side}: Mixed / No clear direction"
-        for m in metrics:
-            st.write(direction_text(np.sign(m["Price Δ"]),np.sign(m["OI Δ"]),m["Side"]))
+# ----------  ML / ADVANCED PLACEHOLDER ----------
+st.header("🤖 Advanced Stat / ML Modules (Placeholders)")
+st.write("""
+- Dynamic Conditional Correlation, cointegration, Bayesian Impact – add via `arch`, `statsmodels`, `bayesian_changepoint_detection`.
+- Feature importances / forecasts – fit XGBoost or LSTM on (price, OI, vol) features.
+""")
 
-else:
-    st.write("👆 Upload intraday 5‑min CSV files to start.")
-
-st.caption("X‑axis shows file times extracted from filenames; add more files in sequence for longer intraday chains.")
+st.success("✅ All core / intermediate / advanced features scaffolded successfully")
