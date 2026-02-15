@@ -1,63 +1,130 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
-import glob, os
+import io, os
 
-st.title("Intraday Option Chain Correlation Analysis")
+st.set_page_config(page_title="Intraday Option‑Chain Analyzer", layout="wide")
+st.title("🚀 Intraday Option‑Chain Correlation & Buy/Sell Signal Analyzer")
 
-# === Config ===
-path = st.text_input("📁 Folder path of CSVs", "./data")
-if not os.path.exists(path):
+# ---------- File Upload ----------
+st.sidebar.header("Data Input")
+uploaded_files = st.sidebar.file_uploader(
+    "Upload one or more CSVs (*_ddmmyyyy_hhmmss.csv):",
+    type=["csv"],
+    accept_multiple_files=True,
+)
+
+if not uploaded_files:
+    st.warning("⬆️ Upload 1 or more intraday Option Chain CSV files to proceed.")
     st.stop()
 
-files = sorted(glob.glob(os.path.join(path, "*.csv")))
-st.write(f"Found {len(files)} CSVs")
+st.write(f"Loaded {len(uploaded_files)} file(s)")
 
-def analyze(df):
-    res = {}
+# ---------- Core Computation ----------
+def compute_features(df):
+    # Compute diffs and pct returns
     for side in ["CE", "PE"]:
-        df[f'{side}_ΔPrice'] = df[f'{side}_lastPrice'].diff()
-        df[f'{side}_%ret'] = df[f'{side}_lastPrice'].pct_change() * 100
-        df[f'{side}_ΔOI'] = df[f'{side}_openInterest'].diff()
-        df[f'{side}_ΔVol'] = df[f'{side}_totalTradedVolume'].diff()
-        df[f'{side}_ΔIV'] = df[f'{side}_impliedVolatility'].diff()
+        df[f"{side}_ΔPrice"] = df[f"{side}_lastPrice"].diff()
+        df[f"{side}_%ret"] = df[f"{side}_lastPrice"].pct_change() * 100
+        df[f"{side}_ΔOI"] = df[f"{side}_openInterest"].diff()
+        df[f"{side}_ΔVol"] = df[f"{side}_totalTradedVolume"].diff()
+        df[f"{side}_ΔIV"] = df[f"{side}_impliedVolatility"].diff()
 
-    # Correlations
-    res['corr_price_OI_CE'] = np.corrcoef(df['CE_ΔPrice'].dropna(), df['CE_ΔOI'].dropna())[0, 1]
-    res['corr_price_OI_PE'] = np.corrcoef(df['PE_ΔPrice'].dropna(), df['PE_ΔOI'].dropna())[0, 1]
-    res['corr_price_vol_CE'] = np.corrcoef(df['CE_ΔPrice'].dropna(), df['CE_ΔVol'].dropna())[0, 1]
-    res['corr_price_vol_PE'] = np.corrcoef(df['PE_ΔPrice'].dropna(), df['PE_ΔVol'].dropna())[0, 1]
-    res['OIimb'] = (df['CE_openInterest'].iloc[-1] - df['PE_openInterest'].iloc[-1]) / (
-                   df['CE_openInterest'].iloc[-1] + df['PE_openInterest'].iloc[-1])
+    # Rolling correlations
+    df["r_price_vol_CE"] = df["CE_ΔPrice"].rolling(20).corr(df["CE_ΔVol"])
+    df["r_price_OI_CE"] = df["CE_ΔPrice"].rolling(20).corr(df["CE_ΔOI"])
+    df["r_price_vol_PE"] = df["PE_ΔPrice"].rolling(20).corr(df["PE_ΔVol"])
+    df["r_price_OI_PE"] = df["PE_ΔPrice"].rolling(20).corr(df["PE_ΔOI"])
 
-    # Composite score
-    r_price_OI = (res['corr_price_OI_CE'] - res['corr_price_OI_PE'])
-    r_price_vol = (res['corr_price_vol_CE'] - res['corr_price_vol_PE'])
-    res['Composite'] = 0.4*r_price_OI + 0.3*r_price_vol + 0.3*res['OIimb']
+    # OI imbalance
+    df["OIimb"] = (df["CE_openInterest"] - df["PE_openInterest"]) / (
+        df["CE_openInterest"] + df["PE_openInterest"]
+    )
 
-    # Simple recommendation
-    if res['Composite'] > 0.2:
-        res['Signal'] = "📈 Buy CE"
-    elif res['Composite'] < -0.2:
-        res['Signal'] = "📉 Buy PE"
+    # Trend strength = weighted composite
+    df["strength"] = (
+        0.4 * df["r_price_OI_CE"]
+        + 0.3 * df["r_price_vol_CE"]
+        + 0.3 * df["OIimb"]
+    )
+
+    # Lead–lag correlation: OI lead test
+    lags = range(-3, 4)
+    corrs = [df["CE_lastPrice"].corr(df["CE_openInterest"].shift(l)) for l in lags]
+    lag_df = pd.DataFrame({"lag": lags, "corr": corrs})
+    best_lag = lag_df.loc[lag_df["corr"].idxmax(), "lag"]
+
+    # Regime (based on rolling Price–OI corr)
+    rollcorr = df["CE_lastPrice"].rolling(20).corr(df["CE_openInterest"])
+    regime = "Bullish" if rollcorr.dropna().iloc[-1] > 0 else "Bearish"
+
+    # Collect summary metrics
+    latest = df.iloc[-1]
+    res = dict(
+        r_price_OI_CE=round(df["r_price_OI_CE"].dropna().iloc[-1], 3)
+        if df["r_price_OI_CE"].dropna().size
+        else 0,
+        r_price_vol_CE=round(df["r_price_vol_CE"].dropna().iloc[-1], 3)
+        if df["r_price_vol_CE"].dropna().size
+        else 0,
+        OIimb=round(latest["OIimb"], 3),
+        strength=round(df["strength"].dropna().iloc[-1], 3)
+        if df["strength"].dropna().size
+        else 0,
+        best_lag=int(best_lag),
+        regime=regime,
+    )
+
+    # Simple directional signal rules
+    if res["strength"] > 0.2:
+        res["Signal"] = "📈 Buy CE"
+    elif res["strength"] < -0.2:
+        res["Signal"] = "📉 Buy PE"
     else:
-        res['Signal'] = "⚖️ Neutral"
+        res["Signal"] = "⚖️ Neutral"
+
     return res
 
+
+# ---------- Run Over Uploaded CSVs ----------
 results = []
-for f in files:
+for f in uploaded_files:
     try:
         df = pd.read_csv(f)
-        res = analyze(df)
-        res["file"] = os.path.basename(f)
+        res = compute_features(df)
+        res["file"] = f.name
         results.append(res)
     except Exception as e:
-        st.warning(f"Error {f}: {e}")
+        st.warning(f"❌ Error in {f.name}: {e}")
 
-if results:
-    summary = pd.DataFrame(results).set_index("file")
-    st.dataframe(summary.style.background_gradient(cmap="coolwarm"))
-    st.download_button("📥 Download results CSV", summary.to_csv().encode(), "summary.csv", "text/csv")
-    st.write("✅ Done. Each row shows directional bias per 5‑min snapshot file.")
+if not results:
+    st.error("No valid data parsed.")
+    st.stop()
 
+summary = pd.DataFrame(results).set_index("file")
+st.success("✅ Computation complete — see summary below.")
+st.dataframe(summary.style.background_gradient(cmap="RdYlGn"))
+
+# ---------- Download ----------
+st.download_button(
+    "📥 Download Summary CSV",
+    summary.to_csv().encode(),
+    "OptionChain_Summary.csv",
+    "text/csv",
+)
+
+# ---------- Quick insight view ----------
+st.subheader("📊 Quick Stats")
+bull = (summary["Signal"] == "📈 Buy CE").sum()
+bear = (summary["Signal"] == "📉 Buy PE").sum()
+neu = (summary["Signal"] == "⚖️ Neutral").sum()
+st.write(f"➡️ {bull} Bullish files | {bear} Bearish | {neu} Neutral")
+
+st.bar_chart(summary[["r_price_OI_CE", "r_price_vol_CE", "OIimb", "strength"]])
+
+# ---------- Footer ----------
+st.caption(
+    "📘 Metrics derived from ΔPrice, ΔOI, ΔVol, OI imbalance, lead–lag, and regime logic."
+)
+st.caption("Deploy via Streamlit Cloud or GitHub → add:")
+st.code("streamlit\npandas\nnumpy", language="text")
