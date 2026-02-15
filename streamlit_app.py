@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 
 st.set_page_config(page_title="Intraday Option‑Chain Analyzer", layout="wide")
-st.title("🚀 Intraday Option‑Chain Correlation & Buy/Sell Signal Analyzer")
+st.title("🚀 Intraday Option‑Chain Correlation & Buy/Sell Signal Analyzer (v2)")
 
 # ---------- File Upload ----------
 st.sidebar.header("Data Input")
@@ -14,14 +14,14 @@ uploaded_files = st.sidebar.file_uploader(
 )
 
 if not uploaded_files:
-    st.warning("⬆️ Upload 1 or more intraday Option Chain CSV files to continue.")
+    st.warning("⬆️ Upload one or more intraday Option Chain CSVs to continue.")
     st.stop()
 
 st.write(f"Loaded {len(uploaded_files)} file(s)")
 
-# ---------- Calculation Function ----------
+# ---------- Core Computation ----------
 def compute_features(df):
-    # Diffs and pct change
+    # Diffs and percent change
     for s in ["CE", "PE"]:
         df[f"{s}_ΔPrice"] = df[f"{s}_lastPrice"].diff()
         df[f"{s}_%ret"] = df[f"{s}_lastPrice"].pct_change() * 100
@@ -35,54 +35,58 @@ def compute_features(df):
     df["r_price_OI_PE"] = df["PE_ΔPrice"].rolling(20).corr(df["PE_ΔOI"])
     df["r_price_vol_PE"] = df["PE_ΔPrice"].rolling(20).corr(df["PE_ΔVol"])
 
-    # OI imbalance
+    # OI imbalance (dynamic)
     df["OIimb"] = (df["CE_openInterest"] - df["PE_openInterest"]) / (
         df["CE_openInterest"] + df["PE_openInterest"]
     )
 
-    # Composite strength score
+    # Composite trend strength
     df["strength"] = (
         0.4 * df["r_price_OI_CE"]
         + 0.3 * df["r_price_vol_CE"]
         + 0.3 * df["OIimb"]
     )
 
-    # Lead–lag correlation
+    # Lead–Lag correlation (fine‑tuned, handles NaNs)
     lags = range(-3, 4)
-    corrs = [df["CE_lastPrice"].corr(df["CE_openInterest"].shift(l)) for l in lags]
+    corrs = []
+    clean = df[["CE_lastPrice", "CE_openInterest"]].dropna()
+    for l in lags:
+        shifted = clean["CE_openInterest"].shift(l)
+        valid = pd.concat([clean["CE_lastPrice"], shifted], axis=1).dropna()
+        corrs.append(valid["CE_lastPrice"].corr(valid["CE_openInterest"]))
     lag_df = pd.DataFrame({"lag": lags, "corr": corrs})
-    best_lag = int(lag_df.loc[lag_df["corr"].idxmax(), "lag"])
+    best_lag = int(lag_df.iloc[lag_df["corr"].idxmax()]["lag"])
 
-    # Regime detection
+    # Regime detection (last rolling corr sign)
     rollcorr = df["CE_lastPrice"].rolling(20).corr(df["CE_openInterest"])
-    regime = "Bullish" if rollcorr.dropna().iloc[-1] > 0 else "Bearish"
+    curr_regime = "Bullish" if rollcorr.dropna().iloc[-1] > 0 else "Bearish"
 
-    # Latest snapshot
-    latest = df.iloc[-1]
+    # Averages + latest values
     res = dict(
-        r_price_OI_CE=round(df["r_price_OI_CE"].dropna().iloc[-1], 3)
-        if df["r_price_OI_CE"].dropna().size
-        else 0,
-        r_price_vol_CE=round(df["r_price_vol_CE"].dropna().iloc[-1], 3)
-        if df["r_price_vol_CE"].dropna().size
-        else 0,
-        OIimb=round(latest["OIimb"], 3),
+        r_price_OI_CE=round(df["r_price_OI_CE"].mean(skipna=True), 3),
+        r_price_vol_CE=round(df["r_price_vol_CE"].mean(skipna=True), 3),
+        OIimb=round(df["OIimb"].mean(skipna=True), 3),
         strength=round(df["strength"].dropna().iloc[-1], 3)
         if df["strength"].dropna().size
         else 0,
         best_lag=best_lag,
-        regime=regime,
+        regime=curr_regime,
     )
 
-    # Signal decision
-    if res["strength"] > 0.2:
+    # --- Signal logic with regime override ---
+    if res["strength"] > 0.2 and curr_regime == "Bullish":
         res["Signal"] = "📈 Buy CE"
-    elif res["strength"] < -0.2:
+    elif res["strength"] < -0.2 and curr_regime == "Bearish":
         res["Signal"] = "📉 Buy PE"
-    else:
+    elif abs(res["strength"]) <= 0.2:
         res["Signal"] = "⚖️ Neutral"
+    else:
+        # conflicting signals → neutralize
+        res["Signal"] = "⚖️ Neutral (conflict)"
 
     return res
+
 
 # ---------- Process Uploaded Files ----------
 results = []
@@ -100,21 +104,21 @@ if not results:
     st.stop()
 
 summary = pd.DataFrame(results).set_index("file")
-st.success("✅ Analysis complete — Summary below.")
+st.success("✅ Analysis complete — summary below.")
 st.dataframe(summary.style.background_gradient(cmap="RdYlGn"))
 
-# ---------- Download Button ----------
+# ---------- Download ----------
 st.download_button(
     "📥 Download Summary CSV",
-    summary.to_csv().encode(),
+    summary.to_csv(index=True).encode(),
     "OptionChain_Summary.csv",
     "text/csv",
 )
 
 # ---------- Quick Overview ----------
 st.subheader("📊 Aggregate Stats")
-bull = (summary["Signal"] == "📈 Buy CE").sum()
-bear = (summary["Signal"] == "📉 Buy PE").sum()
-neu = (summary["Signal"] == "⚖️ Neutral").sum()
+bull = (summary["Signal"].str.contains("Buy CE")).sum()
+bear = (summary["Signal"].str.contains("Buy PE")).sum()
+neu = (summary["Signal"].str.contains("Neutral")).sum()
 st.write(f"➡️ {bull} Bullish files | {bear} Bearish | {neu} Neutral")
 st.bar_chart(summary[["r_price_OI_CE", "r_price_vol_CE", "OIimb", "strength"]])
